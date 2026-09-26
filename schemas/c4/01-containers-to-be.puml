@@ -1,0 +1,102 @@
+@startuml 01-containers-to-be
+!include <C4/C4_Container>
+LAYOUT_TOP_DOWN()
+
+title Container Diagram (To-Be) — CinemaAbyss
+
+Person(viewer, "Viewer", "Watches movies on a phone, laptop or Smart TV: signs up, subscribes, rates movies, keeps favorites.")
+
+System_Boundary(cinema, "CinemaAbyss") {
+
+  ' ---------- Clients ----------
+  Container(web, "Web Application", "SPA", "Browser UI for laptops.")
+  Container(mobile, "Mobile Application", "iOS / Android", "Compact UI, traffic-aware.")
+  Container(tv, "Smart TV Application", "TV OS", "Large poster grid, remote-control navigation.")
+
+  ' ---------- BFF ----------
+  Container(bff_web, "BFF Web & Mobile", "Go", "Aggregates data from several services for web and mobile screens; payload size tuned by query parameters. Can be split later.")
+  Container(bff_tv, "BFF TV", "Go", "Aggregation for the TV interface: large grids, minimal text, low-power devices.")
+
+  ' ---------- Single entry point ----------
+  Container(gateway, "API Gateway", "Kong / proxy-service", "Single entry point: routing, JWT validation, rate limiting, feature flags for traffic shifting.")
+
+  ' ---------- Domains ----------
+  Container(accounts, "Accounts Service", "Go", "Sign-up, sign-in, profile, JWT issuing.")
+  ContainerDb(accounts_db, "Accounts DB", "PostgreSQL", "users")
+
+  Container(movies, "Movies Service", "Go", "Catalog: movie cards, genres, actors. Already extracted from the monolith.")
+  ContainerDb(movies_db, "Movies DB", "PostgreSQL", "movies, movie_genres")
+
+  Container(activity, "Activity Service", "Go", "What a user did with a movie: views, ratings, favorites.")
+  ContainerDb(activity_db, "Activity DB", "PostgreSQL", "views, user_ratings, favorites")
+
+  Container(subscriptions, "Subscriptions Service", "Go", "Plans, checkout, scheduled renewal, next billing date.")
+  ContainerDb(subscriptions_db, "Subscriptions DB", "PostgreSQL", "subscriptions, plans")
+
+  Container(payments, "Payments Service", "Go", "Processes payments through the external provider, transaction history.")
+  ContainerDb(payments_db, "Payments DB", "PostgreSQL", "payments")
+
+  Container(loyalty, "Loyalty Service", "Go", "Discounts, promo codes, partner loyalty programs.")
+  ContainerDb(loyalty_db, "Loyalty DB", "PostgreSQL", "discounts, promo_codes")
+
+  Container(access, "Access Service", "Go", "Answers “can this user watch this movie right now?”. Builds entitlements from subscriptions and promo codes.")
+  ContainerDb(access_db, "Access DB", "PostgreSQL", "entitlements")
+
+  Container(recs, "Recommendations Service", "Go", "Anti-Corruption Layer to the external recommender: sends activity, stores ready-made selections.")
+  ContainerDb(recs_db, "Recommendations DB", "PostgreSQL", "recommendations")
+
+  ContainerQueue(kafka, "Event Broker", "Kafka", "user-events, payment-events, movie-events, subscription-events")
+}
+
+System_Ext(payment_provider, "Payment Provider", "External provider: card charging, payment status webhooks.")
+System_Ext(recsys, "Recommendation System", "Third-party system: builds selections from user activity.")
+System_Ext(partners, "Loyalty Services & Marketplaces", "Partner programs: promo codes, bonuses, joint promotions.")
+
+' ---------- Clients → BFF → Gateway ----------
+Rel(viewer, web, "Uses", "HTTPS")
+Rel(viewer, mobile, "Uses", "HTTPS")
+Rel(viewer, tv, "Uses", "HTTPS")
+Rel(web, bff_web, "Calls API", "HTTPS / JSON")
+Rel(mobile, bff_web, "Calls API", "HTTPS / JSON")
+Rel(tv, bff_tv, "Calls API", "HTTPS / JSON")
+Rel(bff_web, gateway, "Service requests", "REST")
+Rel(bff_tv, gateway, "Service requests", "REST")
+
+' ---------- Gateway → services ----------
+Rel(gateway, accounts, "Routes", "REST")
+Rel(gateway, movies, "Routes", "REST")
+Rel(gateway, activity, "Routes", "REST")
+Rel(gateway, subscriptions, "Routes", "REST")
+Rel(gateway, access, "Checks playback entitlement", "REST")
+Rel(gateway, recs, "Routes", "REST")
+
+' ---------- Services → DBs ----------
+Rel(accounts, accounts_db, "Reads / writes", "SQL")
+Rel(movies, movies_db, "Reads / writes", "SQL")
+Rel(activity, activity_db, "Reads / writes", "SQL")
+Rel(subscriptions, subscriptions_db, "Reads / writes", "SQL")
+Rel(payments, payments_db, "Reads / writes", "SQL")
+Rel(loyalty, loyalty_db, "Reads / writes", "SQL")
+Rel(access, access_db, "Reads / writes", "SQL")
+Rel(recs, recs_db, "Reads / writes", "SQL")
+
+' ---------- Synchronous links (answer needed now) ----------
+Rel(subscriptions, loyalty, "Requests applicable discount", "REST")
+Rel(subscriptions, payments, "Initiates payment (checkout and auto-renewal)", "REST")
+Rel(payments, payment_provider, "Charges", "REST")
+Rel(payment_provider, payments, "Payment status", "Webhook")
+Rel(loyalty, partners, "Validates partner promo codes and bonuses", "REST")
+
+' ---------- Asynchronous links (no immediate answer needed) ----------
+Rel(accounts, kafka, "Account created", "Kafka publish")
+Rel(payments, kafka, "Payment succeeded / failed", "Kafka publish")
+Rel(subscriptions, kafka, "Subscription activated / expired", "Kafka publish")
+Rel(activity, kafka, "Movie watched / rated / added to favorites", "Kafka publish")
+Rel(kafka, subscriptions, "Payment succeeded → activate subscription", "Kafka consume")
+Rel(kafka, access, "Subscription activated / expired → update entitlements", "Kafka consume")
+Rel(kafka, loyalty, "Account created → welcome discount", "Kafka consume")
+Rel(kafka, recs, "User activity", "Kafka consume")
+Rel(recs, recsys, "Sends activity, receives selections", "Async API")
+
+SHOW_LEGEND()
+@enduml
