@@ -369,7 +369,7 @@ cat .docker/config.json | base64
 - «Movies Microservice / Health Check» (`/api/movies/health`) доходит до movies-service при любом `MOVIES_MIGRATION_PERCENT`;
 - «Events Microservice / Health Check» (`/api/events/health`) по правилу ingress идёт прямо в events-service.
 
-`/health` прокси намеренно не зависит от монолита: на него смотрят readiness- и liveness-пробы прокси. Если бы он проксировался в монолит, падение монолита выводило бы из строя весь gateway вместе с movies и events. Проверено при остановленном монолите (`replicas=0`): `/health`, `/api/movies` и `/api/events/health` отвечают 200, под прокси остаётся `1/1 Running`, а недоступность монолита ловят его функциональные тесты — `/api/users` не ответил за 10 секунд.
+`/health` прокси намеренно не зависит от монолита: на него смотрят readiness- и liveness-пробы прокси. Если бы он проксировался в монолит, падение монолита выводило бы из строя весь gateway вместе с movies и events. Проверено при остановленном монолите (`replicas=0`): `/health`, `/api/movies` и `/api/events/health` отвечают 200, под прокси остаётся `1/1 Running`, а недоступность монолита ловят его функциональные тесты — `/api/users` не ответил за 10 секунд: у прокси тогда не было таймаутов. После ревью они добавлены (3 с на соединение, 10 с на ответ), а в mesh из задания 5 такой запрос сразу получает `503 no healthy upstream` от sidecar (проверено: ответ за 0,05 с).
 
 **Скриншоты:**
 
