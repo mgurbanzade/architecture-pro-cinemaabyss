@@ -97,7 +97,7 @@
 | `/api/events*` | events-service |
 | всё остальное (`/api/users`, `/api/payments`, `/api/subscriptions`) | монолит |
 
-Каждый ответ помечается заголовком `X-Upstream: monolith | movies-service | events-service`, выбор апстрима пишется в лог — так видно, куда реально ушёл запрос. Недоступный апстрим превращается в `502 {"error": ...}` вместо зависания. Распределение случайное на каждый запрос: оба апстрима читают одну и ту же базу, поэтому пользователь не увидит разных данных при попадании то в монолит, то в сервис. Проверка распределения — в `main_test.go` (`go test ./...`).
+Каждый ответ помечается заголовком `X-Upstream: monolith | movies-service | events-service`, выбор апстрима пишется в лог — так видно, куда реально ушёл запрос. Недоступный или зависший апстрим превращается в `502 {"error": ...}` вместо зависания (таймауты: 3 с на соединение, 10 с на ожидание ответа). Распределение случайное на каждый запрос: оба апстрима читают одну и ту же базу, поэтому пользователь не увидит разных данных при попадании то в монолит, то в сервис. Проверка распределения — в `main_test.go` (`go test ./...`).
 
 **Events-сервис** — `src/microservices/events` (Go, библиотека `github.com/IBM/sarama`).
 
@@ -337,6 +337,50 @@ cat .docker/config.json | base64
 #### Шаг 3
 Добавьте сюда скриншота вывода при вызове https://cinemaabyss.example.com/api/movies и  скриншот вывода event-service после вызова тестов.
 
+### Решение
+
+**CI/CD** — `.github/workflows/`:
+- `docker-build-push.yml`: добавлены сборка и публикация в GHCR образов `events-service` и `proxy-service` (по образцу monolith и movies), workflow запускается при push в ветку `cinema`.
+- `api-tests.yml`: тесты запускаются при push в `cinema`.
+- `provenance: false` во всех шагах сборки: образ публикуется одиночным amd64-манифестом, а не индексом с аттестацией. Иначе Docker на arm64 (minikube на Apple Silicon) не может его скачать.
+
+Оба workflow зелёные: [Docker Build and Push](https://github.com/mgurbanzade/architecture-pro-cinemaabyss/actions/runs/36252995487), [API Tests](https://github.com/mgurbanzade/architecture-pro-cinemaabyss/actions/runs/36252995466).
+
+**Kubernetes** — `src/kubernetes/`:
+
+| Файл | Что сделано |
+|---|---|
+| `events-service.yaml` | Deployment + Service (8082); startupProbe даёт сервису до 2 минут на подключение к Kafka |
+| `proxy-service.yaml` | Deployment + Service (8000); адреса апстримов и `MOVIES_MIGRATION_PERCENT` берутся из `cinemaabyss-config` |
+| `configmap.yaml` | добавлены `EVENTS_SERVICE_URL` и `KAFKA_BROKERS` |
+| `ingress.yaml` | `/` → proxy-service (API Gateway), `/api/events` → events-service |
+| `monolith.yaml`, `movies-service.yaml` | образы из `ghcr.io/mgurbanzade/architecture-pro-cinemaabyss` |
+| `dockerconfigsecret.yaml` | пакеты в GHCR публичные, поэтому секрет содержит пустой `{"auths":{}}` — токен в публичный репозиторий не попадает |
+
+Прокси читает настройки при старте, поэтому после изменения `MOVIES_MIGRATION_PERCENT` его нужно перезапустить: `kubectl -n cinemaabyss rollout restart deployment/proxy-service`.
+
+**Проверка** (minikube с `--container-runtime=docker`: containerd на arm64 не скачивает amd64-образы, в том числе Kafka и ZooKeeper из шаблона):
+- все 7 подов в статусе `Running`;
+- `MOVIES_MIGRATION_PERCENT` = 0 / 50 / 100 → из 40 запросов к `/api/movies` в movies-service ушло 0 / 19 / 40;
+- `npm run test:kubernetes` — 22 запроса, 42 проверки, 0 ошибок.
+
+**Что проверяют health-check'и через ingress.** В окружении `kubernetes` все адреса ведут на ingress, поэтому:
+- «Monolith Service / Health Check» и «Proxy Service / Health Check» (`GET /health`) проверяют сам прокси: `/health` он отвечает сам, монолит в этой проверке не участвует;
+- «Movies Microservice / Health Check» (`/api/movies/health`) доходит до movies-service при любом `MOVIES_MIGRATION_PERCENT`;
+- «Events Microservice / Health Check» (`/api/events/health`) по правилу ingress идёт прямо в events-service.
+
+`/health` прокси намеренно не зависит от монолита: на него смотрят readiness- и liveness-пробы прокси. Если бы он проксировался в монолит, падение монолита выводило бы из строя весь gateway вместе с movies и events. Проверено при остановленном монолите (`replicas=0`): `/health`, `/api/movies` и `/api/events/health` отвечают 200, под прокси остаётся `1/1 Running`, а недоступность монолита ловят его функциональные тесты — `/api/users` не ответил за 10 секунд.
+
+**Скриншоты:**
+
+Вызов https://cinemaabyss.example.com/api/movies (при `MOVIES_MIGRATION_PERCENT=100` отвечает movies-service):
+
+![Вызов /api/movies](screenshots/task3-api-movies.png)
+
+Логи events-service после `npm run test:kubernetes`: каждое событие публикуется в Kafka и читается consumer'ом:
+
+![Логи events-service](screenshots/task3-events-logs.png)
+
 
 ## Задание 4
 Для простоты дальнейшего обновления и развертывания вам как архитектуру необходимо так же реализовать helm-чарты для прокси-сервиса и проверить работу 
@@ -412,6 +456,48 @@ minikube tunnel
 https://cinemaabyss.example.com/api/movies
 и приложите скриншот развертывания helm и вывода https://cinemaabyss.example.com/api/movies
 
+### Решение
+
+**Что доработано в чарте** — `src/kubernetes/helm/`:
+
+| Файл | Что сделано |
+|---|---|
+| `templates/services/proxy-service.yaml` | Deployment + Service по манифесту из задания 3, все параметры из values; аннотация `checksum/config` перезапускает прокси при изменении configmap |
+| `templates/services/events-service.yaml` | Deployment + Service по манифесту из задания 3, startupProbe на время подключения к Kafka |
+| `values.yaml` | образы всех сервисов из `ghcr.io/mgurbanzade/architecture-pro-cinemaabyss`; `imagePullSecrets.dockerconfigjson` — тот же пустой `{"auths":{}}`, что в задании 3 |
+| `templates/configmap.yaml` | исправлен `MOVIES_SERVICE_URL`, добавлены `EVENTS_SERVICE_URL` и `KAFKA_BROKERS` |
+
+**Дефекты заготовки**, найденные до установки:
+- `imagePullSecrets.dockerconfigjson` в `values.yaml` был обрезанным base64: секрет `kubernetes.io/dockerconfigjson` с невалидным JSON не создаётся, и `helm install` падает.
+- `MOVIES_SERVICE_URL: http://movies:…`, а Service называется `movies-service`: чарт устанавливается, поды поднимаются, но прокси не находит movies, и `/api/movies` отдаёт 502.
+- Проверено и **не** является дефектом: `className: nginx` вместе с аннотацией `kubernetes.io/ingress.class: nginx`. Server-side dry-run показал, что Kubernetes принимает оба поля, если значения совпадают (при расхождении — `must match ingressClassName when both are specified`), поэтому оставлено как есть.
+
+**Порядок проверки:** `helm lint` → `helm template` → server-side dry-run отрендеренного чарта (все объекты — в режиме создания во временном namespace, ingress — в режиме обновления) → удаление ручной установки (`kubectl delete all --all -n cinemaabyss`, `kubectl delete namespace cinemaabyss`) → `helm install cinemaabyss ./src/kubernetes/helm --namespace cinemaabyss --create-namespace`.
+
+**Результат:**
+- все 7 подов `Running`; `npm run test:kubernetes` — 22 запроса, 42 проверки, 0 ошибок; события events-service публикуются и читаются.
+- `kafka`, `monolith` и `movies-service` при установке перезапускаются по одному разу: Helm создаёт всё одновременно, Kafka не дожидается ZooKeeper, а у монолита и movies HTTP-порт не открывается, пока `db.Ping()` ждёт Postgres, и liveness-проба перезапускает контейнер. Дальше Kubernetes сам доводит систему до рабочего состояния; при ручной установке по шагам этого нет.
+- `helm install` пересоздаёт ingress, после этого `minikube tunnel` пришлось перезапустить (с паролем sudo), иначе порты 80/443 не пробрасывались.
+
+**Переключение трафика через Helm.** `MOVIES_MIGRATION_PERCENT` — параметр `config.moviesMigrationPercent` в `values.yaml`, шаблоны править не нужно:
+
+```bash
+helm upgrade cinemaabyss ./src/kubernetes/helm -n cinemaabyss --set config.moviesMigrationPercent=0
+helm upgrade cinemaabyss ./src/kubernetes/helm -n cinemaabyss --reset-values
+```
+
+Благодаря `checksum/config` прокси перезапускается сам: после первой команды 20 из 20 запросов к `/api/movies` ушли в монолит, после второй — в movies-service. `helm upgrade` без `--set` и `-f` переиспользует значения прошлой ревизии, поэтому для возврата к значениям чарта нужен `--reset-values`.
+
+**Скриншоты:**
+
+Helm-релиз (`helm list`, `helm history`, поды):
+
+![Helm-релиз](screenshots/task4-helm-release.png)
+
+Вызов https://cinemaabyss.example.com/api/movies после установки чартом:
+
+![Вызов /api/movies](screenshots/task4-api-movies.png)
+
 
 # Задание 5
 Компания планирует активно развиваться и для повышения надежности, безопасности, реализации сетевых паттернов типа Circuit Breaker и канареечного деплоя вам как архитектору необходимо развернуть istio и настроить circuit breaker для monolith и movies сервисов.
@@ -485,3 +571,32 @@ kubectl delete namespace istio-system
 kubectl delete all --all -n cinemaabyss
 kubectl delete namespace cinemaabyss
 ```
+
+### Решение
+
+**Установка Istio 1.30.5 через Helm** — по шаблону, с двумя поправками для локального стенда:
+- порядок `istio-base` → `istiod --wait` → `istio-ingressgateway`: поды gateway получают образ прокси через injection istiod, поэтому gateway ставится после istiod;
+- Service `istio-ingressgateway` переведён в `ClusterIP` (`helm upgrade istio-ingressgateway istio/gateway -n istio-system --set service.type=ClusterIP`): с типом LoadBalancer `minikube tunnel` отдавал ему порты 80/443 на `127.0.0.1`, и приложение через nginx-ingress переставало отвечать (`Connection reset by peer`). Для circuit breaker входной шлюз Istio не нужен — нагрузка идёт изнутри кластера.
+
+После `kubectl label namespace cinemaabyss istio-injection=enabled` поды нужно перезапустить (`kubectl rollout restart`), иначе sidecar не появится; теперь все поды `2/2`.
+
+**Дефект манифестов Kafka**, всплывший при перезапуске: PVC ZooKeeper был смонтирован в `/var/lib/zookeeper/data`, а образ `wurstmeister/zookeeper` хранит данные в `/opt/zookeeper-3.4.13/data`. После любого перезапуска ZooKeeper терял ID кластера, а Kafka со старым `meta.properties` на своём PVC падала с `InconsistentClusterIdException` — той самой ошибкой, о которой предупреждает задание 4. Исправлен `mountPath` в `src/kubernetes/kafka/kafka.yaml` и `src/kubernetes/helm/templates/kafka/kafka.yaml`, данные Kafka один раз очищены. Проверено: после перезапуска ZooKeeper и Kafka ID кластера сохраняется, рестартов нет.
+
+**Circuit breaker** — `src/kubernetes/circuit-breaker-config.yaml`, `DestinationRule` для `movies-service` и `monolith`:
+- `connectionPool`: 1 соединение, 1 запрос в очереди, 1 запрос на соединение — всё сверх этого sidecar клиента сразу отклоняет с 503;
+- `outlierDetection`: под исключается из балансировки на 30 секунд после 5 ошибок доступности подряд (502/503/504 и сбои соединения). Бизнес-ошибки 500 под не исключают: монолит и movies отвечают 500 даже на запрос несуществующего id, и с правилом «после первой 5xx» один такой запрос выключал бы `/api/movies` через gateway.
+
+**Проверка** — fortio (`-c 50 -qps 0 -n 500`) из пода с sidecar:
+
+| Цель | Без circuit breaker | С circuit breaker |
+|---|---|---|
+| `movies-service:8081/api/movies` | 200: 498, ошибки соединения: 2; в среднем 1,27 с на запрос | 200: 6, **503: 494**; в среднем 3,4 мс на запрос |
+| `monolith:8080/api/users` | 200: 500 | 200: 17, **503: 483** |
+
+`upstream_rq_pending_overflow` в sidecar fortio — 493 и 483: почти все ответы 503 (493 из 494 у movies и все 483 у монолита) отдал сам circuit breaker при переполнении очереди, не дожидаясь перегруженного сервиса. `upstream_rq_pending_failure_eject` = 0 — выбросов не было. Бизнес-ошибка сервис не выключает: после `GET /api/movies?id=999999` (ответ 500) следующие запросы к `/api/movies` через gateway отвечают 200. При обычной нагрузке система работает: `npm run test:kubernetes` через ingress с Istio и circuit breaker — 22 запроса, 42 проверки, 0 ошибок.
+
+Istio ставился через Helm, поэтому и удалять его удобнее через Helm: `helm uninstall istio-ingressgateway istiod istio-base -n istio-system` (в шаблоне — `istioctl uninstall --purge`).
+
+**Скриншот:**
+
+![Circuit breaker](screenshots/task5-circuit-breaker.png)

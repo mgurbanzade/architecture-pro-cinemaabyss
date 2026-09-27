@@ -76,14 +76,14 @@ func newProducer(brokers []string) (*Producer, error) {
 	return &Producer{sp: sp}, nil
 }
 
-func (p *Producer) Publish(topic string, ev Event) (int32, int64, error) {
+func (p *Producer) Publish(topic, key string, ev Event) (int32, int64, error) {
 	body, err := json.Marshal(ev)
 	if err != nil {
 		return 0, 0, err
 	}
 	msg := &sarama.ProducerMessage{
 		Topic: topic,
-		Key:   sarama.StringEncoder(ev.ID),
+		Key:   sarama.StringEncoder(key),
 		Value: sarama.ByteEncoder(body),
 	}
 	return p.sp.SendMessage(msg)
@@ -168,13 +168,15 @@ func (s *server) handleEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	key := buildID(kind, payload)
+	now := time.Now().UTC()
 	ev := Event{
-		ID:        buildID(kind, payload),
+		ID:        fmt.Sprintf("%s-%d", key, now.UnixNano()),
 		Type:      kind.name,
-		Timestamp: time.Now().UTC(),
+		Timestamp: now,
 		Payload:   payload,
 	}
-	partition, offset, err := s.producer.Publish(kind.topic, ev)
+	partition, offset, err := s.producer.Publish(kind.topic, key, ev)
 	if err != nil {
 		log.Printf("[producer] failed to publish to %s: %v", kind.topic, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to publish event"})

@@ -2,13 +2,12 @@ FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
-# go.sum is optional here: if it is missing, `go mod tidy` below creates it.
-COPY go.mod go.su[m] ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o events-service .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o events-service .
 
 FROM alpine:latest
 

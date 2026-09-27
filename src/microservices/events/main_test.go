@@ -50,6 +50,9 @@ func TestCreateEvents(t *testing.T) {
 			if msg.Topic != tc.wantTopic {
 				t.Errorf("%s: topic %q, want %q", tc.path, msg.Topic, tc.wantTopic)
 			}
+			if key, _ := msg.Key.Encode(); string(key) != tc.wantID {
+				t.Errorf("%s: key %q, want %q", tc.path, key, tc.wantID)
+			}
 			return nil
 		})
 		rec := post(s, tc.path, tc.body)
@@ -60,7 +63,7 @@ func TestCreateEvents(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 			t.Fatal(err)
 		}
-		if resp.Status != "success" || resp.Event.ID != tc.wantID || resp.Event.Type != strings.TrimPrefix(tc.path, "/api/events/") {
+		if resp.Status != "success" || !strings.HasPrefix(resp.Event.ID, tc.wantID+"-") || resp.Event.Type != strings.TrimPrefix(tc.path, "/api/events/") {
 			t.Errorf("%s: unexpected response %+v", tc.path, resp)
 		}
 	}
@@ -81,5 +84,22 @@ func TestValidation(t *testing.T) {
 	s.handleEvent(rec, httptest.NewRequest(http.MethodGet, "/api/events/movie", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET: code=%d", rec.Code)
+	}
+}
+
+func TestEventIDsAreUnique(t *testing.T) {
+	s, mp := newTestServer(t)
+	ids := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		mp.ExpectSendMessageAndSucceed()
+		rec := post(s, "/api/events/movie", `{"movie_id":1,"title":"Test","action":"viewed"}`)
+		var resp EventResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if ids[resp.Event.ID] {
+			t.Fatalf("duplicate event id %q", resp.Event.ID)
+		}
+		ids[resp.Event.ID] = true
 	}
 }

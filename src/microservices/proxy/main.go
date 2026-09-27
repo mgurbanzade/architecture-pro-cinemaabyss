@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -17,6 +18,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+)
+
+const (
+	upstreamDialTimeout    = 3 * time.Second
+	defaultUpstreamTimeout = 10 * time.Second
 )
 
 // Config holds everything the proxy needs, read from environment variables.
@@ -27,6 +33,7 @@ type Config struct {
 	EventsServiceURL       *url.URL
 	GradualMigration       bool
 	MoviesMigrationPercent int
+	UpstreamTimeout        time.Duration
 }
 
 func loadConfig() Config {
@@ -37,6 +44,7 @@ func loadConfig() Config {
 		EventsServiceURL:       mustParseURL(getenv("EVENTS_SERVICE_URL", "http://localhost:8082")),
 		GradualMigration:       strings.EqualFold(getenv("GRADUAL_MIGRATION", "false"), "true"),
 		MoviesMigrationPercent: 0,
+		UpstreamTimeout:        defaultUpstreamTimeout,
 	}
 
 	percent, err := strconv.Atoi(getenv("MOVIES_MIGRATION_PERCENT", "0"))
@@ -69,23 +77,25 @@ type Router struct {
 	monolith http.Handler
 	movies   http.Handler
 	events   http.Handler
-	rnd      *rand.Rand
 }
 
 func NewRouter(cfg Config) *Router {
 	return &Router{
 		cfg:      cfg,
-		monolith: newReverseProxy(cfg.MonolithURL, "monolith"),
-		movies:   newReverseProxy(cfg.MoviesServiceURL, "movies-service"),
-		events:   newReverseProxy(cfg.EventsServiceURL, "events-service"),
-		rnd:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		monolith: newReverseProxy(cfg.MonolithURL, "monolith", cfg.UpstreamTimeout),
+		movies:   newReverseProxy(cfg.MoviesServiceURL, "movies-service", cfg.UpstreamTimeout),
+		events:   newReverseProxy(cfg.EventsServiceURL, "events-service", cfg.UpstreamTimeout),
 	}
 }
 
 // newReverseProxy builds a reverse proxy that marks responses with the
 // upstream name and turns upstream failures into a JSON 502.
-func newReverseProxy(target *url.URL, name string) http.Handler {
+func newReverseProxy(target *url.URL, name string, timeout time.Duration) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: upstreamDialTimeout}).DialContext
+	transport.ResponseHeaderTimeout = timeout
+	proxy.Transport = transport
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		resp.Header.Set("X-Upstream", name)
 		return nil
@@ -106,7 +116,7 @@ func (rt *Router) pickMoviesUpstream() (http.Handler, string) {
 	if !rt.cfg.GradualMigration {
 		return rt.movies, "movies-service"
 	}
-	if rt.rnd.Intn(100) < rt.cfg.MoviesMigrationPercent {
+	if rand.Intn(100) < rt.cfg.MoviesMigrationPercent {
 		return rt.movies, "movies-service"
 	}
 	return rt.monolith, "monolith"
